@@ -1,7 +1,7 @@
 import torch.nn as nn
 from datasets.dataset import SingleClassDataset
 from models.unet import UNet
-from utils import config_plot
+from utils import config_plot, create_all_indices
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import torchvision.transforms.functional as F
 
 
-def main():
+def main(save_plots=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Create the model, loss function, and optimizer
     in_channels = 4
@@ -31,8 +31,8 @@ def main():
         random.shuffle(indices)
         split_index = int(0.8 * len(indices))
         train(device, model, indices_name, indices, split_index, optimizer)
-        test(device, model, indices_name, indices, split_index)
-        break
+        test(device, model, indices_name, indices, split_index, save_plots)
+        break  # TODO: przerzucając z single-class na multi-class zacząć od wywalenia tego break
 
 
 def train(device, model, indices_name, indices, split_index, optimizer):
@@ -78,18 +78,18 @@ def train(device, model, indices_name, indices, split_index, optimizer):
         torch.save({"state_dict": model.state_dict()}, checkpt_path)
 
 
-def test(device, model, indices_name, indices, split_index):
+def test(device, model, indices_name, indices, split_index, save_plots):
     test_dataset = SingleClassDataset(
         image_directory="data/supervised/Agriculture-Vision-2021/val/images",
         label_directory=f"data/supervised/Agriculture-Vision-2021/val/labels/{indices_name}",
         valid_indices=indices[split_index:],
         transform=transforms.ToTensor(),
-        save_data=True,
+        save_data=save_plots,
     )
 
     state_dict = torch.load(f"checkpoints/nir_{indices_name}_checkpoint_1_epochs")[
         "state_dict"
-    ]  # 1 trzeba ustawić
+    ]  # trzeba poprawić żeby dobry checkpoint się wybierał a nie '1' na stałe
     model.load_state_dict(state_dict)
 
     criterion = nn.CrossEntropyLoss()
@@ -132,65 +132,59 @@ def test(device, model, indices_name, indices, split_index):
     custom_cmap = ListedColormap(custom_colors, name="custom_colormap")
 
     model.eval()
-    preds = []
     gts = []
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
     model.cpu()
+
+    os.makedirs("results", exist_ok=True)
     with torch.no_grad():
-        for data in test_loader:
+        for i, data in enumerate(test_loader):
             inputs, labels = data
             gts.append(labels)
             outputs = model(inputs)
             labels = labels.long()
-            # Convert output to probabilities and get the predicted class
             _, predicted = torch.max(outputs, 1)
 
-            # Display the original image, ground truth, and predicted segmentation mask
-            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            if save_plots:
+                fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
-            # Original image
-            axes[0].imshow(F.to_pil_image(inputs[0]))  # Assuming batch_size=1
-            axes[0].set_title("Original Image")
-            config_plot(axes[0])
+                axes[0].imshow(F.to_pil_image(inputs[0]))
+                axes[0].set_title("Original Image")
+                config_plot(axes[0])
 
-            # Ground truth label
-            axes[1].imshow(
-                labels[0].squeeze(0), cmap=custom_cmap, vmin=0, vmax=9
-            )  # Assuming single-channel labels
-            axes[1].set_title("Ground Truth")
-            config_plot(axes[1])
+                axes[1].imshow(labels[0].squeeze(0), cmap=custom_cmap, vmin=0, vmax=9)
+                axes[1].set_title("Ground Truth")
+                config_plot(axes[1])
 
-            # Predicted segmentation mask
-            axes[2].imshow(
-                predicted[0].squeeze(0), cmap=custom_cmap, vmin=0, vmax=9
-            )  # Adjust cmap as needed
-            axes[2].set_title("Predicted Mask")
+                axes[2].imshow(predicted[0].squeeze(0), cmap=custom_cmap, vmin=0, vmax=9)
+                axes[2].set_title("Predicted Mask")
+                config_plot(axes[2])
 
-            preds.append(predicted)
+                legend_labels = ["Background", "Water Area"]
+                plt.legend(
+                    handles=[
+                        plt.Line2D(
+                            [0], [0],
+                            marker="o", color="w",
+                            markerfacecolor=color,
+                            markersize=10,
+                            label=label
+                        ) for color, label in zip(custom_colors, legend_labels)
+                    ],
+                    title="Legend",
+                    loc="upper left",
+                    bbox_to_anchor=(1, 1),
+                )
 
-            legend_labels = ["Background", "Water Area"]
-            plt.legend(
-                handles=[
-                    plt.Line2D(
-                        [0],
-                        [0],
-                        marker="o",
-                        color="w",
-                        markerfacecolor=color,
-                        markersize=10,
-                        label=label,
-                    )
-                    for color, label in zip(custom_colors, legend_labels)
-                ],
-                title="Legend",
-                loc="upper left",
-                bbox_to_anchor=(1, 1),
-            )
+                # Save figure to results/
+                filename = f"results/{indices_name}_{i}.png"
+                plt.savefig(filename, bbox_inches="tight")
+                plt.close(fig)
 
-            config_plot(axes[2])
-            plt.show()
+                print("Saved figure to:", filename)
             print("Loss:", criterion(outputs, labels.squeeze(1)).item())
 
 
 if __name__ == "__main__":
-    main()
+    # create_all_indices()
+    main(save_plots=False)
