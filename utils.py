@@ -82,6 +82,40 @@ def get_good_single_class_indices(folder_path):
     return good_label_indices
 
 
+def get_valid_multiclass_indices(label_root):
+    transform = transforms.ToTensor()
+    all_class_dirs = sorted(os.listdir(label_root))
+    num_files = len(os.listdir(os.path.join(label_root, all_class_dirs[0])))
+
+    good_indices = []
+
+    for i in range(num_files):
+        found_positive = False
+
+        for class_dir in all_class_dirs:
+            class_path = os.path.join(label_root, class_dir)
+            file = sorted(os.listdir(class_path))[i]
+
+            try:
+                label = Image.open(os.path.join(class_path, file))
+                label_tensor = transform(label)
+                if label_tensor.max() > 0:
+                    found_positive = True
+                    break  # no need to check other classes
+
+            except (Image.UnidentifiedImageError, OSError) as e:
+                print(f"Error reading file {file}: {e}")
+                continue
+
+        if found_positive:
+            good_indices.append(i)
+
+        if i % 100 == 0:
+            print(f"Checked {i}/{num_files}")
+
+    return good_indices
+
+
 def plot(tensor):
     fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(1, 1, 1)
@@ -101,12 +135,21 @@ def config_plot(ax):
         spine.set_visible(False)
 
 
-def create_all_indices():
-    for dir in os.listdir("data/supervised/Agriculture-Vision-2021/val/labels/"):
+def create_all_indices(indices_type="val"):
+    for dir in os.listdir(f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels/"):
         indices = get_good_single_class_indices(
-            f"data/supervised/Agriculture-Vision-2021/val/labels/{dir}"
+            f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels/{dir}"
         )
         os.makedirs("indices", exist_ok=True)
-        with open(f"indices/{dir}.pkl", "wb") as f:
+        with open(f"indices/{indices_type}/{dir}.pkl", "wb") as f:
             print(f"Dumping indices to: {dir}.pkl")
             pickle.dump(indices, f)
+
+
+def create_multiclass_indices(indices_type="val"):
+    label_root = f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels"
+    indices = get_valid_multiclass_indices(label_root)
+    os.makedirs("indices", exist_ok=True)
+    with open(f"indices/{indices_type}/all_classes.pkl", "wb") as f:
+        pickle.dump(indices, f)
+    print(f"Saved {len(indices)} valid multi-class indices to indices/{indices_type}/all_classes.pkl")
