@@ -1,7 +1,8 @@
 import torch.nn as nn
 from datasets.dataset import MultiClassDataset
+from sklearn.metrics import f1_score, jaccard_score
+import numpy as np
 from models.unet import UNet
-from utils import config_plot, create_all_indices, create_multiclass_indices
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -9,17 +10,22 @@ import os
 import torch
 import random
 import pickle
-from matplotlib.colors import ListedColormap
-import matplotlib.pyplot as plt
-import torchvision.transforms.functional as F
+import json
+from datetime import datetime
 
 
-def main(save_plots=False):
+def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     in_channels = 4
     out_channels = 9
     model = UNet(in_channels, out_channels)
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.00045)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2
+    )
 
     indices_type = "val"
 
@@ -55,23 +61,42 @@ def main(save_plots=False):
         label_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels",
         valid_indices=test_indices,
         transform=input_transform,
-        save_data=save_plots,
     )
 
-    best_model_path = train(device, model, optimizer, train_dataset, val_dataset)
-    test(device, model, test_dataset, best_model_path, save_plots, indices_type)
+    log = {
+        "hyperparameters": {
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "optimizer": "Adam",
+            "learning_rate": 0.00045,
+            "scheduler": "ReduceLROnPlateau(factor=0.5, patience=2)",
+            "batch_size": 32,
+            "num_epochs": 20,
+        },
+        "train_history": [],
+        "final_results": {},
+    }
+
+    best_model_path = train(
+        device, model, optimizer, scheduler, train_dataset, val_dataset, log
+    )
+    test(device, model, test_dataset, best_model_path, log)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = f"results/training_log_{timestamp}.json"
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+    print(f"Training log saved to {log_path}")
 
 
-def train(device, model, optimizer, train_dataset, val_dataset):
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
+def train(device, model, optimizer, scheduler, train_dataset, val_dataset, log):
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
     criterion = nn.BCEWithLogitsLoss()
 
-    model.to(device)
     best_val_acc = 0.0
     best_model_path = "checkpoints/best_model.pth"
     os.makedirs("checkpoints", exist_ok=True)
 
-    for epoch in range(10):
+    for epoch in range(30):
         model.train()
         correct_pixels = 0
         total_pixels = 0
@@ -88,8 +113,8 @@ def train(device, model, optimizer, train_dataset, val_dataset):
             total_loss += loss.item()
 
             with torch.no_grad():
-                _, predicted = torch.max(outputs, 1)
-                true_labels = torch.argmax(labels, dim=1)
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                true_labels = labels.float()
                 correct_pixels += (predicted == true_labels).sum().item()
                 total_pixels += true_labels.numel()
 
@@ -97,13 +122,30 @@ def train(device, model, optimizer, train_dataset, val_dataset):
         avg_train_loss = total_loss / len(train_loader)
 
         print(
-            f"Epoch [{epoch + 1}/10]\nTrain Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}"
+            f"Epoch [{epoch + 1}/30]\nTrain Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}"
         )
 
         # Validate after each epoch
-        val_acc, val_loss = validate(device, model, val_dataset)
+        val_acc, val_loss, val_f1, val_iou = validate(device, model, val_dataset)
 
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}\n")
+        print(
+            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}, Val IoU: {val_iou:.4f}\n"
+        )
+
+        scheduler.step(val_loss)
+
+        log["train_history"].append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": avg_train_loss,
+                "train_accuracy": train_acc,
+                "val_loss": val_loss,
+                "val_accuracy": val_acc,
+                "val_f1_score": val_f1,
+                "val_iou": val_iou,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
 
         # Save best model
         if val_acc > best_val_acc:
@@ -124,149 +166,103 @@ def validate(
 ):
     if model_path:
         model.load_state_dict(torch.load(model_path)["state_dict"])
-    model.to(device)
     model.eval()
 
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
     criterion = nn.BCEWithLogitsLoss()
 
     total_loss = 0.0
     correct_pixels = 0
     total_pixels = 0
+    all_preds = []
+    all_trues = []
 
     with torch.no_grad():
         for inputs, labels in val_loader:
             inputs, labels = inputs.to(device), labels.to(device)
+
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             total_loss += loss.item()
 
-            _, predicted = torch.max(outputs, 1)
-            true_labels = torch.argmax(labels, dim=1)
+            # Multi-label prediction: sigmoid + threshold
+            predicted = (torch.sigmoid(outputs) > 0.5).float()
+            true_labels = labels.float()
+
+            # For computing flat pixel-level accuracy
             correct_pixels += (predicted == true_labels).sum().item()
             total_pixels += true_labels.numel()
+
+            # Flatten for metric logging
+            all_preds.append(predicted.cpu().numpy().astype(int).flatten())
+            all_trues.append(true_labels.cpu().numpy().astype(int).flatten())
 
     acc = correct_pixels / total_pixels
     avg_loss = total_loss / len(val_loader)
 
-    if save_plots and indices_type:
-        save_visualizations(model.cpu(), indices_type)
+    y_pred = np.concatenate(all_preds)
+    y_true = np.concatenate(all_trues)
 
-    return acc, avg_loss
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    iou = jaccard_score(y_true, y_pred, average="macro", zero_division=0)
+
+    return acc, avg_loss, f1, iou
 
 
-def test(device, model, test_dataset, model_path, save_plots=False, indices_type=None):
+def test(device, model, test_dataset, model_path, log=None):
     model.load_state_dict(torch.load(model_path)["state_dict"])
-    model.to(device)
     model.eval()
 
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
     criterion = nn.BCEWithLogitsLoss()
 
     total_loss = 0.0
     correct_pixels = 0
     total_pixels = 0
+    all_preds = []
+    all_trues = []
 
     with torch.no_grad():
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)
+
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             total_loss += loss.item()
 
-            _, predicted = torch.max(outputs, 1)
-            true_labels = torch.argmax(labels, dim=1)
+            predicted = (torch.sigmoid(outputs) > 0.5).float()
+            true_labels = labels.float()
+
+            all_preds.append(predicted.cpu().numpy().flatten())
+            all_trues.append(true_labels.cpu().numpy().flatten())
+
             correct_pixels += (predicted == true_labels).sum().item()
             total_pixels += true_labels.numel()
 
     acc = correct_pixels / total_pixels
     avg_loss = total_loss / len(test_loader)
 
+    y_pred = np.concatenate(all_preds)
+    y_true = np.concatenate(all_trues)
+
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    iou = jaccard_score(y_true, y_pred, average="macro", zero_division=0)
+
+    log["final_results"] = {
+        "test_loss": avg_loss,
+        "test_accuracy": acc,
+        "test_f1_score": f1,
+        "test_iou": iou,
+    }
+
     print(f"\n=== Final Test Results ===")
     print(f"Test Accuracy: {acc:.4f}")
     print(f"Test Loss: {avg_loss:.4f}")
-
-    if save_plots and indices_type:
-        save_visualizations(model.cpu(), test_dataset, indices_type)
-
-
-def save_visualizations(model, indices_type):
-    custom_colors = [
-        "#1f77b4",
-        "#bcbd22",
-        "#2ca02c",
-        "#ff7f0e",
-        "#d62728",
-        "#9467bd",
-        "#8c564b",
-        "#e377c2",
-        "#7f7f7f",
-        "#17becf",
-    ]
-
-    # Create a new colormap with custom colors
-    custom_cmap = ListedColormap(custom_colors, name="custom_colormap")
-
-    model.eval()
-    gts = []
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
-    model.cpu()
-
-    os.makedirs("results", exist_ok=True)
-    with torch.no_grad():
-        for i, data in enumerate(test_loader):
-            inputs, labels = data
-            gts.append(labels)
-            outputs = model(inputs)
-            labels = labels.long()
-            _, predicted = torch.max(outputs, 1)
-
-            if save_plots:
-                fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-
-                axes[0].imshow(F.to_pil_image(inputs[0]))
-                axes[0].set_title("Original Image")
-                config_plot(axes[0])
-
-                axes[1].imshow(labels[0].squeeze(0), cmap=custom_cmap, vmin=0, vmax=9)
-                axes[1].set_title("Ground Truth")
-                config_plot(axes[1])
-
-                axes[2].imshow(
-                    predicted[0].squeeze(0), cmap=custom_cmap, vmin=0, vmax=9
-                )
-                axes[2].set_title("Predicted Mask")
-                config_plot(axes[2])
-
-                legend_labels = ["Background", "Water Area"]
-                plt.legend(
-                    handles=[
-                        plt.Line2D(
-                            [0],
-                            [0],
-                            marker="o",
-                            color="w",
-                            markerfacecolor=color,
-                            markersize=10,
-                            label=label,
-                        )
-                        for color, label in zip(custom_colors, legend_labels)
-                    ],
-                    title="Legend",
-                    loc="upper left",
-                    bbox_to_anchor=(1, 1),
-                )
-
-                # Save figure to results/
-                filename = f"results/{indices_type}_{i}.png"
-                plt.savefig(filename, bbox_inches="tight")
-                plt.close(fig)
-
-                print("Saved figure to:", filename)
-            print("Loss:", criterion(outputs, labels.squeeze(1)).item())
+    print(f"Test F1 Score: {f1:.4f}")
+    print(f"Test IoU: {iou:.4f}")
 
 
 if __name__ == "__main__":
     # create_all_indices()
     # create_multiclass_indices("train")
-    main(save_plots=True)
+    main()
