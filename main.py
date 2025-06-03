@@ -16,95 +16,181 @@ import torchvision.transforms.functional as F
 
 def main(save_plots=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Create the model, loss function, and optimizer
     in_channels = 4
-    out_channels = 9  # Number of classes for single-class segmentation
+    out_channels = 9
     model = UNet(in_channels, out_channels)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    indices_type = "val" # or train
+    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+
+    indices_type = "val"
 
     with open(f"indices/{indices_type}/all_classes.pkl", "rb") as file:
         indices = pickle.load(file)
 
     random.seed(637)
     random.shuffle(indices)
-    split_index = int(0.8 * len(indices))
-    train(device, model, indices, split_index, optimizer, indices_type)
-    test(device, model, indices, split_index, save_plots, indices_type)
+    total = len(indices)
+    train_split = int(0.7 * total)
+    val_split = int(0.85 * total)
 
-    torch.save({"state_dict": model.state_dict()}, "checkpoints/final_model.pth")
+    train_indices = indices[:train_split]
+    val_indices = indices[train_split:val_split]
+    test_indices = indices[val_split:]
 
+    input_transform = transforms.Normalize(mean=[0.5] * 4, std=[0.5] * 4)
 
-def train(device, model, indices, split_index, optimizer, indices_type):
     train_dataset = MultiClassDataset(
         image_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/images",
         label_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels",
-        valid_indices=indices[:split_index],
-        transform=transforms.ToTensor(),
+        valid_indices=train_indices,
+        transform=input_transform,
+    )
+    val_dataset = MultiClassDataset(
+        image_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/images",
+        label_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels",
+        valid_indices=val_indices,
+        transform=input_transform,
+    )
+    test_dataset = MultiClassDataset(
+        image_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/images",
+        label_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels",
+        valid_indices=test_indices,
+        transform=input_transform,
+        save_data=save_plots,
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    best_model_path = train(device, model, optimizer, train_dataset, val_dataset)
+    test(device, model, test_dataset, best_model_path, save_plots, indices_type)
 
+
+def train(device, model, optimizer, train_dataset, val_dataset):
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
     criterion = nn.BCEWithLogitsLoss()
 
     model.to(device)
-    num_epochs = 10
-    for epoch in range(num_epochs):
+    best_val_acc = 0.0
+    best_model_path = "checkpoints/best_model.pth"
+    os.makedirs("checkpoints", exist_ok=True)
+
+    for epoch in range(10):
         model.train()
+        correct_pixels = 0
+        total_pixels = 0
+        total_loss = 0.0
+
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
 
             optimizer.zero_grad()
             outputs = model(inputs)
-
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
 
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}")
+            with torch.no_grad():
+                _, predicted = torch.max(outputs, 1)
+                true_labels = torch.argmax(labels, dim=1)
+                correct_pixels += (predicted == true_labels).sum().item()
+                total_pixels += true_labels.numel()
 
-        checkpt_path = (
-            f"checkpoints/nir_{indices_type}_checkpoint_" + str(epoch + 1) + "_epochs"
+        train_acc = correct_pixels / total_pixels
+        avg_train_loss = total_loss / len(train_loader)
+
+        print(
+            f"Epoch [{epoch + 1}/10]\nTrain Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}"
         )
-        os.makedirs("checkpoints", exist_ok=True)
-        torch.save({"state_dict": model.state_dict()}, checkpt_path)
+
+        # Validate after each epoch
+        val_acc, val_loss = validate(device, model, val_dataset)
+
+        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}\n")
+
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({"state_dict": model.state_dict()}, best_model_path)
+
+        # Optionally save per-epoch model
+        torch.save(
+            {"state_dict": model.state_dict()},
+            f"checkpoints/model_epoch_{epoch + 1}.pth",
+        )
+
+    return best_model_path
 
 
-def test(device, model, indices, split_index, save_plots, indices_type):
-    test_dataset = MultiClassDataset(
-        image_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/images",
-        label_directory=f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels",
-        valid_indices=indices[split_index:],
-        transform=transforms.ToTensor(),
-        save_data=save_plots,
-    )
-
-    state_dict = torch.load(f"checkpoints/nir_{indices_type}_checkpoint_1_epochs")[
-        "state_dict"
-    ]  # trzeba poprawić żeby dobry checkpoint się wybierał a nie '1' na stałe
-    model.load_state_dict(state_dict)
+def validate(
+    device, model, val_dataset, model_path=None, save_plots=False, indices_type=None
+):
+    if model_path:
+        model.load_state_dict(torch.load(model_path)["state_dict"])
     model.to(device)
     model.eval()
 
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     criterion = nn.BCEWithLogitsLoss()
 
-    total_test_loss = 0.0
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=True)
+    total_loss = 0.0
+    correct_pixels = 0
+    total_pixels = 0
+
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+
+            _, predicted = torch.max(outputs, 1)
+            true_labels = torch.argmax(labels, dim=1)
+            correct_pixels += (predicted == true_labels).sum().item()
+            total_pixels += true_labels.numel()
+
+    acc = correct_pixels / total_pixels
+    avg_loss = total_loss / len(val_loader)
+
+    if save_plots and indices_type:
+        save_visualizations(model.cpu(), indices_type)
+
+    return acc, avg_loss
+
+
+def test(device, model, test_dataset, model_path, save_plots=False, indices_type=None):
+    model.load_state_dict(torch.load(model_path)["state_dict"])
+    model.to(device)
+    model.eval()
+
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    criterion = nn.BCEWithLogitsLoss()
+
+    total_loss = 0.0
+    correct_pixels = 0
+    total_pixels = 0
 
     with torch.no_grad():
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)
-
             outputs = model(inputs)
             loss = criterion(outputs, labels)
-            total_test_loss += loss.item()
+            total_loss += loss.item()
 
-    # Calculate average test loss
-    average_test_loss = total_test_loss / len(test_loader)
+            _, predicted = torch.max(outputs, 1)
+            true_labels = torch.argmax(labels, dim=1)
+            correct_pixels += (predicted == true_labels).sum().item()
+            total_pixels += true_labels.numel()
 
-    print(f"Average Test Loss: {average_test_loss:.4f}")
+    acc = correct_pixels / total_pixels
+    avg_loss = total_loss / len(test_loader)
 
-    # Define custom colors for each class
+    print(f"\n=== Final Test Results ===")
+    print(f"Test Accuracy: {acc:.4f}")
+    print(f"Test Loss: {avg_loss:.4f}")
+
+    if save_plots and indices_type:
+        save_visualizations(model.cpu(), test_dataset, indices_type)
+
+
+def save_visualizations(model, indices_type):
     custom_colors = [
         "#1f77b4",
         "#bcbd22",

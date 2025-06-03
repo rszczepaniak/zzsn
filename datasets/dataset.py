@@ -3,6 +3,7 @@ from PIL import Image
 import os
 import torch
 import numpy as np
+from torchvision import transforms
 
 
 class MultiClassDataset(Dataset):
@@ -14,7 +15,7 @@ class MultiClassDataset(Dataset):
         transform=None,
         label_transform=None,
         save_data=False,
-        num_classes=9
+        num_classes=9,
     ):
         self.rgb_directory = os.path.join(image_directory, "rgb")
         self.nir_directory = os.path.join(image_directory, "nir")
@@ -22,8 +23,15 @@ class MultiClassDataset(Dataset):
         self.num_classes = num_classes
 
         self.class_names = [
-            "double_plant", "drydown", "endrow", "nutrient_deficiency",
-            "planter_skip", "storm_damage", "water", "waterway", "weed_cluster"
+            "double_plant",
+            "drydown",
+            "endrow",
+            "nutrient_deficiency",
+            "planter_skip",
+            "storm_damage",
+            "water",
+            "waterway",
+            "weed_cluster",
         ]
 
         self.label_class_dirs = [
@@ -37,15 +45,22 @@ class MultiClassDataset(Dataset):
         self.valid_rgb_files = [self.all_rgb_files[i] for i in self.valid_indices]
         self.valid_nir_files = [self.all_nir_files[i] for i in self.valid_indices]
 
-        # Load label file names for each class
+        self.sorted_label_files_per_class = [
+            sorted(os.listdir(class_dir)) for class_dir in self.label_class_dirs
+        ]
         self.valid_label_files = [
-            [sorted(os.listdir(class_dir))[i] for i in self.valid_indices]
-            for class_dir in self.label_class_dirs
+            [class_files[i] for i in self.valid_indices]
+            for class_files in self.sorted_label_files_per_class
         ]
 
         self.transform = transform
         self.label_transform = label_transform
         self.save_data = save_data
+
+        if self.save_data:
+            os.makedirs("test_result/rgbs", exist_ok=True)
+            os.makedirs("test_result/nirs", exist_ok=True)
+            os.makedirs("test_result/labels", exist_ok=True)
 
     def __len__(self):
         return len(self.valid_rgb_files)
@@ -57,11 +72,21 @@ class MultiClassDataset(Dataset):
         rgb = Image.open(rgb_path).convert("RGB")
         nir = Image.open(nir_path)
 
-        if self.transform:
-            rgb = self.transform(rgb)
-            nir = self.transform(nir)
+        if self.save_data and (idx % 3 == 0):
+            rgb.save(f"test_result/rgbs/{idx}.png")
+            nir.save(f"test_result/nirs/{idx}.png")
 
-        image = torch.cat((rgb, nir), dim=0)
+        rgb_tensor = transforms.ToTensor()(rgb)
+        nir_tensor = transforms.ToTensor()(nir)
+
+        assert rgb_tensor.shape[1:] == nir_tensor.shape[1:], (
+            f"RGB/NIR shape mismatch at idx {idx}"
+        )
+        image = torch.cat((rgb_tensor, nir_tensor), dim=0)  # [4, H, W]
+
+        # Now apply 4-channel normalization if provided
+        if self.transform:
+            image = self.transform(image)
 
         label_tensor = []
 
@@ -75,15 +100,11 @@ class MultiClassDataset(Dataset):
             label_tensor.append(torch.from_numpy(binary_mask))
 
         label_tensor = torch.stack(label_tensor, dim=0)  # Shape: [num_classes, H, W]
+        assert label_tensor.shape[1:] == image.shape[1:], (
+            f"Label/image mismatch at idx {idx}"
+        )
 
         if self.label_transform:
             label_tensor = self.label_transform(label_tensor)
-
-        if self.save_data and (idx % 3 == 0):
-            os.makedirs("test_result/rgbs", exist_ok=True)
-            os.makedirs("test_result/nirs", exist_ok=True)
-            os.makedirs("test_result/labels", exist_ok=True)
-            rgb.save(f"test_result/rgbs/{idx}.png")
-            nir.save(f"test_result/nirs/{idx}.png")
 
         return image, label_tensor

@@ -136,7 +136,9 @@ def config_plot(ax):
 
 
 def create_all_indices(indices_type="val"):
-    for dir in os.listdir(f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels/"):
+    for dir in os.listdir(
+        f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels/"
+    ):
         indices = get_good_single_class_indices(
             f"data/supervised/Agriculture-Vision-2021/{indices_type}/labels/{dir}"
         )
@@ -152,4 +154,6 @@ def create_multiclass_indices(indices_type="val"):
     os.makedirs("indices", exist_ok=True)
     with open(f"indices/{indices_type}/all_classes.pkl", "wb") as f:
         pickle.dump(indices, f)
-    print(f"Saved {len(indices)} valid multi-class indices to indices/{indices_type}/all_classes.pkl")
+    print(
+        f"Saved {len(indices)} valid multi-class indices to indices/{indices_type}/all_classes.pkl"
+    )
