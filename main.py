@@ -4,6 +4,7 @@ from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardInde
 from datasets.dataset import MultiClassDataset, UnlabeledDataset, PseudoLabeledDataset
 from sklearn.metrics import f1_score, jaccard_score
 import numpy as np
+from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
 from models.unet import UNet
 import torch.optim as optim
 from torch.utils.data import DataLoader, ConcatDataset
@@ -155,6 +156,7 @@ def train(
     pos_weights = pos_weights.to(device)
     criterion = CustomBCEWithLogitsLoss(pos_weights)
 
+    model.to(device)
     best_val_acc = 0.0
     best_model_path = f"checkpoints/best_model_{timestamp}.pth"
     os.makedirs("checkpoints", exist_ok=True)
