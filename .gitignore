@@ -3,6 +3,7 @@
 __pycache__
 data
 data/
+data
 logs/
 checkpoints/
 indices/

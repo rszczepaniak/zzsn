@@ -1,19 +1,26 @@
 import random
 
 from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
+import shutil
+import torch.nn as nn
 from datasets.dataset import MultiClassDataset, UnlabeledDataset, PseudoLabeledDataset
 from sklearn.metrics import f1_score, jaccard_score
 import numpy as np
 from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
+from datasets.dataset import MultiClassDataset, UnlabeledDataset, PseudoLabeledDataset
 from models.unet import UNet
 import torch.optim as optim
 from torch.utils.data import DataLoader, ConcatDataset
 from torchvision import transforms
+from utils import config_plot, create_all_indices, create_multiclass_indices
 import os
 import torch
 import pickle
 import json
 from datetime import datetime
+from matplotlib.colors import ListedColormap
+import matplotlib.pyplot as plt
+import torchvision.transforms.functional as F
 
 from utils import compute_class_pos_weights, CustomBCEWithLogitsLoss
 
@@ -192,6 +199,7 @@ def train(
         )
 
         # Validate after each epoch
+        print("validation start")
         val_acc, val_loss, val_f1, val_iou = validate(
             device, model, val_dataset, pos_weights, log
         )
