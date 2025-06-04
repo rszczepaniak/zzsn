@@ -1,5 +1,3 @@
-import shutil
-
 import torch.nn as nn
 from datasets.dataset import MultiClassDataset
 from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
@@ -70,25 +68,28 @@ def main():
             "learning_rate": 0.00045,
             "scheduler": "ReduceLROnPlateau(factor=0.5, patience=2)",
             "batch_size": 32,
-            "num_epochs": 10,
+            "num_epochs": 50,
         },
         "train_history": [],
         "final_results": {},
     }
 
-    best_model_path = train(
-        device, model, optimizer, scheduler, train_dataset, val_dataset, log
-    )
-    test(device, model, test_dataset, best_model_path, log)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = f"results/training_log_{timestamp}.json"
+
+    best_model_path = train(
+        device, model, optimizer, scheduler, train_dataset, val_dataset, log, timestamp
+    )
+    test(device, model, test_dataset, best_model_path, log)
+
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
-    shutil.move("checkpoints/best_model.pth", f"checkpoints/best_model_{timestamp}.pth")
     print(f"Training log saved to {log_path}")
 
 
-def train(device, model, optimizer, scheduler, train_dataset, val_dataset, log):
+def train(
+    device, model, optimizer, scheduler, train_dataset, val_dataset, log, timestamp
+):
     train_loader = DataLoader(
         train_dataset, batch_size=32, shuffle=True, num_workers=6, pin_memory=True
     )
@@ -96,7 +97,7 @@ def train(device, model, optimizer, scheduler, train_dataset, val_dataset, log):
 
     model.to(device)
     best_val_acc = 0.0
-    best_model_path = "checkpoints/best_model.pth"
+    best_model_path = f"checkpoints/best_model_{timestamp}.pth"
     os.makedirs("checkpoints", exist_ok=True)
 
     for epoch in range(log["hyperparameters"]["num_epochs"]):
