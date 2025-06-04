@@ -1,6 +1,7 @@
 *.odt
 *.pdf
 __pycache__
+data
 data/
 logs/
 checkpoints/
