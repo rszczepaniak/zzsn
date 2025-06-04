@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Load environment
-source /net/tscratch/people/plgrszczepaniak/.envs/zzsn/bin/activate
+source /net/tscratch/people/plgszymonjank/zzsn/.venv/bin/activate
 
 # Run your Python script
 mkdir logs -p

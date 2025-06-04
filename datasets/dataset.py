@@ -4,6 +4,8 @@ import os
 import torch
 import numpy as np
 from torchvision import transforms
+import math
+import rasterio  # Zastąp imageio na rasterio dla dużych TIFF-ów
 
 
 class MultiClassDataset(Dataset):
@@ -108,3 +110,86 @@ class MultiClassDataset(Dataset):
             label_tensor = self.label_transform(label_tensor)
 
         return image, label_tensor
+
+
+class UnlabeledDataset(Dataset):
+    def __init__(self, root_dir, transform=None, tile_size=512, stride=512):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.tile_size = tile_size
+        self.stride = stride
+        self.sample_dirs = [
+            os.path.join(root_dir, d)
+            for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        ]
+
+    def __len__(self):
+        return len(self.sample_dirs)
+
+    def __getitem__(self, idx):
+        sample_path = self.sample_dirs[idx]
+        imagery_dir = os.path.join(sample_path, "imagery")
+
+        try:
+            with rasterio.open(os.path.join(imagery_dir, "red.tif")) as red_ds, \
+                 rasterio.open(os.path.join(imagery_dir, "green.tif")) as green_ds, \
+                 rasterio.open(os.path.join(imagery_dir, "blue.tif")) as blue_ds, \
+                 rasterio.open(os.path.join(imagery_dir, "nir.tif")) as nir_ds:
+
+                height, width = red_ds.height, red_ds.width
+
+                tiles = []
+                tile_positions = []
+
+                for y in range(0, height, self.stride):
+                    for x in range(0, width, self.stride):
+                        y_end = min(y + self.tile_size, height)
+                        x_end = min(x + self.tile_size, width)
+                        if y_end - y < self.tile_size or x_end - x < self.tile_size:
+                            continue
+
+                        window = rasterio.windows.Window(x, y, x_end - x, y_end - y)
+
+                        red = red_ds.read(1, window=window)
+                        green = green_ds.read(1, window=window)
+                        blue = blue_ds.read(1, window=window)
+                        nir = nir_ds.read(1, window=window)  # Poprawka: wczytanie NIR z nir_ds
+
+                        # Normalizuj do [0, 1]
+                        red = red.astype(np.float32) / 255.0 if red.max() > 1 else red
+                        green = green.astype(np.float32) / 255.0 if green.max() > 1 else green
+                        blue = blue.astype(np.float32) / 255.0 if blue.max() > 1 else blue
+                        nir = nir.astype(np.float32) / 255.0 if nir.max() > 1 else nir
+
+                        # Konwertuj na tensory i połącz kanały
+                        tile = torch.stack([torch.from_numpy(red), torch.from_numpy(green),
+                                          torch.from_numpy(blue), torch.from_numpy(nir)], dim=0)
+
+                        if self.transform:
+                            tile = self.transform(tile)
+
+                        tiles.append(tile)
+                        tile_positions.append((y, x, y_end, x_end))
+
+                return tiles, tile_positions, (height, width)
+
+        except Exception as e:
+            print(f"Error loading image at {sample_path}: {e}")
+            return [], [], (0, 0)
+
+
+class PseudoLabeledDataset(Dataset):
+    def __init__(self, pseudo_data_paths):
+        super().__init__()
+        self.pseudo_data_paths = pseudo_data_paths
+
+    def __len__(self):
+        return len(self.pseudo_data_paths)
+
+    def __getitem__(self, idx):
+        data = torch.load(self.pseudo_data_paths[idx])
+        image = data['image']  # [4, 512, 512]
+        mask = data['mask']    # [9, 512, 512]
+
+        return image, mask

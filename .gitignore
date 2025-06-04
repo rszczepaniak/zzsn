@@ -6,4 +6,7 @@ logs/
 checkpoints/
 indices/
 test_result/
-results/
+.venv/
+pseudo_data
+results
+datasets/__pycache__/
