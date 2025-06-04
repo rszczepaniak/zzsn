@@ -1,7 +1,8 @@
+import shutil
+
 import torch.nn as nn
 from datasets.dataset import MultiClassDataset
-from sklearn.metrics import f1_score, jaccard_score
-import numpy as np
+from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
 from models.unet import UNet
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -16,12 +17,10 @@ from datetime import datetime
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     in_channels = 4
     out_channels = 9
     model = UNet(in_channels, out_channels)
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-    model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.00045)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=2
@@ -71,7 +70,7 @@ def main():
             "learning_rate": 0.00045,
             "scheduler": "ReduceLROnPlateau(factor=0.5, patience=2)",
             "batch_size": 32,
-            "num_epochs": 20,
+            "num_epochs": 10,
         },
         "train_history": [],
         "final_results": {},
@@ -85,18 +84,22 @@ def main():
     log_path = f"results/training_log_{timestamp}.json"
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
+    shutil.move("checkpoints/best_model.pth", f"checkpoints/best_model_{timestamp}.pth")
     print(f"Training log saved to {log_path}")
 
 
 def train(device, model, optimizer, scheduler, train_dataset, val_dataset, log):
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+    train_loader = DataLoader(
+        train_dataset, batch_size=32, shuffle=True, num_workers=6, pin_memory=True
+    )
     criterion = nn.BCEWithLogitsLoss()
 
+    model.to(device)
     best_val_acc = 0.0
     best_model_path = "checkpoints/best_model.pth"
     os.makedirs("checkpoints", exist_ok=True)
 
-    for epoch in range(30):
+    for epoch in range(log["hyperparameters"]["num_epochs"]):
         model.train()
         correct_pixels = 0
         total_pixels = 0
@@ -122,7 +125,7 @@ def train(device, model, optimizer, scheduler, train_dataset, val_dataset, log):
         avg_train_loss = total_loss / len(train_loader)
 
         print(
-            f"Epoch [{epoch + 1}/30]\nTrain Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}"
+            f"Epoch [{epoch + 1}/{log['hyperparameters']['num_epochs']}]\nTrain Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}"
         )
 
         # Validate after each epoch
@@ -152,30 +155,24 @@ def train(device, model, optimizer, scheduler, train_dataset, val_dataset, log):
             best_val_acc = val_acc
             torch.save({"state_dict": model.state_dict()}, best_model_path)
 
-        # Optionally save per-epoch model
-        torch.save(
-            {"state_dict": model.state_dict()},
-            f"checkpoints/model_epoch_{epoch + 1}.pth",
-        )
-
     return best_model_path
 
 
-def validate(
-    device, model, val_dataset, model_path=None, save_plots=False, indices_type=None
-):
-    if model_path:
-        model.load_state_dict(torch.load(model_path)["state_dict"])
+def validate(device, model, val_dataset):
     model.eval()
 
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+    val_loader = DataLoader(
+        val_dataset, batch_size=32, shuffle=False, num_workers=6, pin_memory=True
+    )
     criterion = nn.BCEWithLogitsLoss()
+
+    # Initialize GPU-based metrics
+    f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)
+    iou_metric = MultilabelJaccardIndex(num_labels=9, average="macro").to(device)
 
     total_loss = 0.0
     correct_pixels = 0
     total_pixels = 0
-    all_preds = []
-    all_trues = []
 
     with torch.no_grad():
         for inputs, labels in val_loader:
@@ -185,26 +182,24 @@ def validate(
             loss = criterion(outputs, labels)
             total_loss += loss.item()
 
-            # Multi-label prediction: sigmoid + threshold
-            predicted = (torch.sigmoid(outputs) > 0.5).float()
-            true_labels = labels.float()
+            predicted = (torch.sigmoid(outputs) > 0.5).long()
+            true_labels = labels.long()
 
-            # For computing flat pixel-level accuracy
+            # Accuracy
             correct_pixels += (predicted == true_labels).sum().item()
             total_pixels += true_labels.numel()
 
-            # Flatten for metric logging
-            all_preds.append(predicted.cpu().numpy().astype(int).flatten())
-            all_trues.append(true_labels.cpu().numpy().astype(int).flatten())
+            # Update torchmetrics
+            f1_metric.update(predicted, true_labels)
+            iou_metric.update(predicted, true_labels)
 
     acc = correct_pixels / total_pixels
     avg_loss = total_loss / len(val_loader)
+    f1 = f1_metric.compute().item()
+    iou = iou_metric.compute().item()
 
-    y_pred = np.concatenate(all_preds)
-    y_true = np.concatenate(all_trues)
-
-    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    iou = jaccard_score(y_true, y_pred, average="macro", zero_division=0)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     return acc, avg_loss, f1, iou
 
@@ -213,14 +208,16 @@ def test(device, model, test_dataset, model_path, log=None):
     model.load_state_dict(torch.load(model_path)["state_dict"])
     model.eval()
 
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True)
     criterion = nn.BCEWithLogitsLoss()
+
+    # GPU-based metrics
+    f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)
+    iou_metric = MultilabelJaccardIndex(num_labels=9, average="macro").to(device)
 
     total_loss = 0.0
     correct_pixels = 0
     total_pixels = 0
-    all_preds = []
-    all_trues = []
 
     with torch.no_grad():
         for inputs, labels in test_loader:
@@ -230,30 +227,27 @@ def test(device, model, test_dataset, model_path, log=None):
             loss = criterion(outputs, labels)
             total_loss += loss.item()
 
-            predicted = (torch.sigmoid(outputs) > 0.5).float()
-            true_labels = labels.float()
-
-            all_preds.append(predicted.cpu().numpy().flatten())
-            all_trues.append(true_labels.cpu().numpy().flatten())
+            predicted = (torch.sigmoid(outputs) > 0.5).long()
+            true_labels = labels.long()
 
             correct_pixels += (predicted == true_labels).sum().item()
             total_pixels += true_labels.numel()
 
+            f1_metric.update(predicted, true_labels)
+            iou_metric.update(predicted, true_labels)
+
     acc = correct_pixels / total_pixels
     avg_loss = total_loss / len(test_loader)
+    f1 = f1_metric.compute().item()
+    iou = iou_metric.compute().item()
 
-    y_pred = np.concatenate(all_preds)
-    y_true = np.concatenate(all_trues)
-
-    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    iou = jaccard_score(y_true, y_pred, average="macro", zero_division=0)
-
-    log["final_results"] = {
-        "test_loss": avg_loss,
-        "test_accuracy": acc,
-        "test_f1_score": f1,
-        "test_iou": iou,
-    }
+    if log is not None:
+        log["final_results"] = {
+            "test_loss": avg_loss,
+            "test_accuracy": acc,
+            "test_f1_score": f1,
+            "test_iou": iou,
+        }
 
     print(f"\n=== Final Test Results ===")
     print(f"Test Accuracy: {acc:.4f}")
