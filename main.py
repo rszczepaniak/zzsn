@@ -1,28 +1,18 @@
 import random
 
 from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
-import shutil
-import torch.nn as nn
-from datasets.dataset import MultiClassDataset, UnlabeledDataset, PseudoLabeledDataset
-from sklearn.metrics import f1_score, jaccard_score
-import numpy as np
-from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
 from datasets.dataset import MultiClassDataset, UnlabeledDataset, PseudoLabeledDataset
 from models.unet import UNet
 import torch.optim as optim
 from torch.utils.data import DataLoader, ConcatDataset
 from torchvision import transforms
-from utils import config_plot, create_all_indices, create_multiclass_indices
 import os
 import torch
 import pickle
 import json
 from datetime import datetime
-from matplotlib.colors import ListedColormap
-import matplotlib.pyplot as plt
-import torchvision.transforms.functional as F
 
-from utils import compute_class_pos_weights, CustomBCEWithLogitsLoss
+from utils import compute_class_pos_weights, CustomBCEWithLogitsLoss, generate_pseudo_labels
 
 
 def main():
@@ -115,27 +105,32 @@ def main():
     )
 
     print("\n=== Generowanie pseudoetykiet z danych nieoznakowanych ===")
-    pseudo_data_paths = generate_pseudo_labels(model, unlabeled_dataset, device, threshold=0.9)
-
+    generate_pseudo_labels(
+        model, unlabeled_dataset, device, threshold=0.9
+    )
+    pseudo_data_paths = os.listdir("pseudo_data")
+    print("\n=== Skończono generację pseudoetykiet z danych nieoznakowanych ===")
     if len(pseudo_data_paths) > 0:
-        pseudo_dataset = PseudoLabeledDataset(pseudo_data_paths)
+        pseudo_dataset = PseudoLabeledDataset(pseudo_data_paths, transform=input_transform)
         combined_dataset = ConcatDataset([train_dataset, pseudo_dataset])
         print(f"Dodano {len(pseudo_data_paths)} próbek z pseudoetykietami.\n")
     else:
         combined_dataset = train_dataset
         print("Brak próbek spełniających próg ufności.\n")
 
-    best_model_path = train(device,
-                            model,
-                            optimizer,
-                            scheduler,
-                            combined_dataset,
-                            val_dataset,
-                            log,
-                            timestamp,
-                            pos_weights,)
+    best_model_path = train(
+        device,
+        model,
+        optimizer,
+        scheduler,
+        combined_dataset,
+        val_dataset,
+        log,
+        timestamp,
+        pos_weights,
+    )
 
-    test(device, model, test_dataset, best_model_path, log, pos_weights)
+    test(device, model, test_dataset, best_model_path, log, pos_weights, False)
 
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
@@ -171,25 +166,25 @@ def train(
     for epoch in range(log["hyperparameters"]["num_epochs"]):
         model.train()
         correct_pixels = 0
-        total_pixels = 0
-        total_loss = 0.0
+        total_pixels = 1
+        total_loss = 0.1
 
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-            with torch.no_grad():
-                predicted = (torch.sigmoid(outputs) > 0.5).long()
-                true_labels = labels.long()
-                correct_pixels += (predicted == true_labels).sum().item()
-                total_pixels += true_labels.numel()
+        # for inputs, labels in train_loader:
+        #     inputs, labels = inputs.to(device), labels.to(device)
+        #
+        #     optimizer.zero_grad()
+        #     outputs = model(inputs)
+        #
+        #     loss = criterion(outputs, labels)
+        #     loss.backward()
+        #     optimizer.step()
+        #     total_loss += loss.item()
+        #
+        #     with torch.no_grad():
+        #         predicted = (torch.sigmoid(outputs) > 0.5).long()
+        #         true_labels = labels.long()
+        #         correct_pixels += (predicted == true_labels).sum().item()
+        #         total_pixels += true_labels.numel()
 
         train_acc = correct_pixels / total_pixels
         avg_train_loss = total_loss / len(train_loader)
@@ -247,28 +242,29 @@ def validate(device, model, val_dataset, pos_weights, log):
     f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)
     iou_metric = MultilabelJaccardIndex(num_labels=9, average="macro").to(device)
 
-    total_loss = 0.0
+    total_loss = 0.1
     correct_pixels = 0
-    total_pixels = 0
+    total_pixels = 1
 
     with torch.no_grad():
-        for inputs, labels in val_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item()
-
-            predicted = (torch.sigmoid(outputs) > 0.5).long()
-            true_labels = labels.long()
-
-            # Accuracy
-            correct_pixels += (predicted == true_labels).sum().item()
-            total_pixels += true_labels.numel()
-
-            # Update torchmetrics
-            f1_metric.update(predicted, true_labels)
-            iou_metric.update(predicted, true_labels)
+        pass
+        # for inputs, labels in val_loader:
+        #     inputs, labels = inputs.to(device), labels.to(device)
+        #
+        #     outputs = model(inputs)
+        #     loss = criterion(outputs, labels)
+        #     total_loss += loss.item()
+        #
+        #     predicted = (torch.sigmoid(outputs) > 0.5).long()
+        #     true_labels = labels.long()
+        #
+        #     # Accuracy
+        #     correct_pixels += (predicted == true_labels).sum().item()
+        #     total_pixels += true_labels.numel()
+        #
+        #     # Update torchmetrics
+        #     f1_metric.update(predicted, true_labels)
+        #     iou_metric.update(predicted, true_labels)
 
     acc = correct_pixels / total_pixels
     avg_loss = total_loss / len(val_loader)
@@ -281,8 +277,9 @@ def validate(device, model, val_dataset, pos_weights, log):
     return acc, avg_loss, f1, iou
 
 
-def test(device, model, test_dataset, model_path, log=None, pos_weights=None):
-    model.load_state_dict(torch.load(model_path)["state_dict"])
+def test(device, model, test_dataset, model_path, log=None, pos_weights=None, load_model=False):
+    if load_model:
+        model.load_state_dict(torch.load(model_path)["state_dict"])
     model.eval()
 
     test_loader = DataLoader(
@@ -333,57 +330,6 @@ def test(device, model, test_dataset, model_path, log=None, pos_weights=None):
     print(f"Test Loss: {avg_loss:.4f}")
     print(f"Test F1 Score: {f1:.4f}")
     print(f"Test IoU: {iou:.4f}")
-
-
-def custom_collate_fn(batch):
-    tiles, tile_positions, sizes = zip(*batch)
-    flat_tiles = [tile for sample_tiles in tiles for tile in sample_tiles]
-    flat_positions = [pos for sample_pos in tile_positions for pos in sample_pos]
-    if flat_tiles:
-        batch_tiles = torch.stack(flat_tiles, dim=0)
-    else:
-        batch_tiles = torch.tensor([])
-    return batch_tiles, flat_positions, sizes
-
-
-def generate_pseudo_labels(model, unlabeled_dataset, device, threshold=0.9):
-    model.eval()
-    model.to(device)
-    loader = DataLoader(unlabeled_dataset, batch_size=1, shuffle=False, num_workers=0,
-                        collate_fn=custom_collate_fn)
-    pseudo_data_paths = []
-    os.makedirs("pseudo_data", exist_ok=True)
-
-    with torch.no_grad():
-        for idx, (tiles, tile_positions, sizes) in enumerate(loader):
-            if not tiles.numel():  # Skip empty tiles
-                continue
-
-            height, width = sizes[0]
-            sub_batch_size = 8
-
-            for i in range(0, len(tiles), sub_batch_size):
-                sub_tiles = tiles[i:i + sub_batch_size].to(device)
-                sub_positions = tile_positions[i:i + sub_batch_size]
-
-                outputs = model(sub_tiles)
-                probs = torch.sigmoid(outputs)
-                mask = probs > threshold
-
-                for j, (y, x, y_end, x_end) in enumerate(sub_positions):
-                    tile_image = sub_tiles[j]  # [4, 512, 512]
-                    tile_mask = mask[j]        # [9, 512, 512]
-
-                    confident_pixels = tile_mask.sum(dim=(1, 2)) > 0
-                    if confident_pixels.any():
-                        output_path = f"pseudo_data/sample_{idx}_tile_{i+j}.pt"
-                        torch.save({'image': tile_image.cpu(), 'mask': tile_mask.float().cpu()}, output_path)
-                        pseudo_data_paths.append(output_path)
-
-                del sub_tiles, outputs, probs, mask
-                torch.cuda.empty_cache() if device.type == "cuda" else None
-
-    return pseudo_data_paths
 
 
 if __name__ == "__main__":

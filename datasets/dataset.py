@@ -131,12 +131,20 @@ class UnlabeledDataset(Dataset):
         sample_path = self.sample_dirs[idx]
         imagery_dir = os.path.join(sample_path, "imagery")
 
-        try:
-            with rasterio.open(os.path.join(imagery_dir, "red.tif")) as red_ds, \
-                 rasterio.open(os.path.join(imagery_dir, "green.tif")) as green_ds, \
-                 rasterio.open(os.path.join(imagery_dir, "blue.tif")) as blue_ds, \
-                 rasterio.open(os.path.join(imagery_dir, "nir.tif")) as nir_ds:
+        # Ensure all files exist
+        required_files = ["red.tif", "green.tif", "blue.tif", "nir.tif"]
+        for fname in required_files:
+            full_path = os.path.join(imagery_dir, fname)
+            if not os.path.isfile(full_path):
+                raise FileNotFoundError(f"Missing {fname} in {imagery_dir}")
 
+        try:
+            with (
+                rasterio.open(os.path.join(imagery_dir, "red.tif")) as red_ds,
+                rasterio.open(os.path.join(imagery_dir, "green.tif")) as green_ds,
+                rasterio.open(os.path.join(imagery_dir, "blue.tif")) as blue_ds,
+                rasterio.open(os.path.join(imagery_dir, "nir.tif")) as nir_ds,
+            ):
                 height, width = red_ds.height, red_ds.width
 
                 tiles = []
@@ -151,20 +159,26 @@ class UnlabeledDataset(Dataset):
 
                         window = rasterio.windows.Window(x, y, x_end - x, y_end - y)
 
-                        red = red_ds.read(1, window=window)
-                        green = green_ds.read(1, window=window)
-                        blue = blue_ds.read(1, window=window)
-                        nir = nir_ds.read(1, window=window)  # Poprawka: wczytanie NIR z nir_ds
+                        def read_and_norm(ds):
+                            band = ds.read(1, window=window).astype(np.float32)
+                            max_val = band.max()
+                            if max_val == 0:
+                                return band  # or raise Warning?
+                            return band / max_val if max_val > 1 else band
 
-                        # Normalizuj do [0, 1]
-                        red = red.astype(np.float32) / 255.0 if red.max() > 1 else red
-                        green = green.astype(np.float32) / 255.0 if green.max() > 1 else green
-                        blue = blue.astype(np.float32) / 255.0 if blue.max() > 1 else blue
-                        nir = nir.astype(np.float32) / 255.0 if nir.max() > 1 else nir
+                        tile = torch.stack(
+                            [
+                                torch.from_numpy(read_and_norm(red_ds)),
+                                torch.from_numpy(read_and_norm(green_ds)),
+                                torch.from_numpy(read_and_norm(blue_ds)),
+                                torch.from_numpy(read_and_norm(nir_ds)),
+                            ],
+                            dim=0,
+                        )
 
-                        # Konwertuj na tensory i połącz kanały
-                        tile = torch.stack([torch.from_numpy(red), torch.from_numpy(green),
-                                          torch.from_numpy(blue), torch.from_numpy(nir)], dim=0)
+                        assert tile.shape == (4, self.tile_size, self.tile_size), (
+                            f"Invalid tile shape: {tile.shape}"
+                        )
 
                         if self.transform:
                             tile = self.transform(tile)
@@ -172,24 +186,43 @@ class UnlabeledDataset(Dataset):
                         tiles.append(tile)
                         tile_positions.append((y, x, y_end, x_end))
 
-                return tiles, tile_positions, (height, width)
+            if not tiles:
+                raise ValueError(f"No valid tiles found in {sample_path}")
 
-        except Exception as e:
-            print(f"Error loading image at {sample_path}: {e}")
-            return [], [], (0, 0)
-
+            return {
+                "tiles": tiles,
+                "positions": tile_positions,
+                "shape": (height, width),
+                "sample_path": sample_path,
+            }
+        except rasterio.errors.RasterioIOError as e:
+            print(f"⚠️ Skipping corrupted file in {sample_path}: {e}")
+            return {
+                "tiles": [],
+                "positions": [],
+                "shape": (0, 0),
+                "sample_path": sample_path
+            }
 
 class PseudoLabeledDataset(Dataset):
-    def __init__(self, pseudo_data_paths):
-        super().__init__()
+    def __init__(self, pseudo_data_paths, transform=None):
         self.pseudo_data_paths = pseudo_data_paths
+        self.transform = transform
 
     def __len__(self):
         return len(self.pseudo_data_paths)
 
     def __getitem__(self, idx):
         data = torch.load(self.pseudo_data_paths[idx])
-        image = data['image']  # [4, 512, 512]
-        mask = data['mask']    # [9, 512, 512]
+        image = data["image"]
+        mask = data["mask"]
+
+        assert image.shape == (4, 512, 512), (
+            f"Invalid pseudo image shape: {image.shape}"
+        )
+        assert mask.shape == (9, 512, 512), f"Invalid pseudo mask shape: {mask.shape}"
+
+        if self.transform:
+            image = self.transform(image)
 
         return image, mask
