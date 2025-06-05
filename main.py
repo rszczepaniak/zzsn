@@ -23,8 +23,8 @@ def main():
     out_channels = 9
     learning_rate = 0.0002
     batch_size = 32
-    epochs = 1
-    number_of_pseudo_labels_training_epochs = 3
+    epochs = 20
+    number_of_pseudo_labels_training_epochs = 2
 
     log = {
         "hyperparameters": {
@@ -42,6 +42,7 @@ def main():
     }
 
     model = UNet(in_channels, out_channels)
+    model.load_state_dict(torch.load("checkpoints/best_model_20250605_002445.pth")["state_dict"])
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=2
@@ -86,16 +87,16 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = f"results/training_log_{timestamp}.json"
 
-    best_model_path = train(
-        device,
-        model,
-        optimizer,
-        scheduler,
-        train_dataset,
-        val_dataset,
-        log,
-        timestamp,
-    )
+    # best_model_path = train(
+    #     device,
+    #     model,
+    #     optimizer,
+    #     scheduler,
+    #     train_dataset,
+    #     val_dataset,
+    #     log,
+    #     timestamp,
+    # )
 
     print("\n=== Kafelkowanie ===")
     unlabeled_dataset = UnlabeledDataset(
