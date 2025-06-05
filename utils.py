@@ -1,9 +1,11 @@
 from torchvision import transforms
 from PIL import Image
+import torch.nn as nn
 import os
 import torch
 import pickle
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 
 
 def read_class_labels(class_name, i, start, end):
@@ -157,3 +159,39 @@ def create_multiclass_indices(indices_type="val"):
     print(
         f"Saved {len(indices)} valid multi-class indices to indices/{indices_type}/all_classes.pkl"
     )
+
+
+def compute_class_pos_weights(dataset, num_classes=9):
+    loader = DataLoader(
+        dataset, batch_size=32, shuffle=False, num_workers=6, pin_memory=True
+    )
+
+    positive_pixel_counts = torch.zeros(num_classes)
+    total_pixel_count = 0
+
+    for _, labels in loader:
+        B, C, H, W = labels.shape
+
+        positive_pixel_counts += labels.sum(
+            dim=(0, 2, 3)
+        )  # Sum over batch + spatial dims
+        total_pixel_count += B * H * W
+
+    neg_pixel_counts = total_pixel_count - positive_pixel_counts
+    pos_weights = neg_pixel_counts / (positive_pixel_counts + 1e-6)
+
+    return pos_weights
+
+
+class CustomBCEWithLogitsLoss(nn.Module):
+    def __init__(self, pos_weight):
+        super().__init__()
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, input, target):
+        # input, target: [B, C, H, W]
+        B, C, H, W = input.shape
+        pw = self.pos_weight.view(1, C, 1, 1)
+        return nn.functional.binary_cross_entropy_with_logits(
+            input, target, pos_weight=pw
+        )

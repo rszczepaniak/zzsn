@@ -1,4 +1,5 @@
-import torch.nn as nn
+import random
+
 from datasets.dataset import MultiClassDataset
 from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
 from models.unet import UNet
@@ -7,10 +8,11 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import os
 import torch
-import random
 import pickle
 import json
 from datetime import datetime
+
+from utils import compute_class_pos_weights, CustomBCEWithLogitsLoss
 
 
 def main():
@@ -18,8 +20,26 @@ def main():
 
     in_channels = 4
     out_channels = 9
+    learning_rate = 0.0002
+    batch_size = 32
+    epochs = 1
+
+    log = {
+        "hyperparameters": {
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "optimizer": "Adam",
+            "learning_rate": learning_rate,
+            "scheduler": "ReduceLROnPlateau(factor=0.5, patience=2)",
+            "batch_size": batch_size,
+            "num_epochs": epochs,
+        },
+        "train_history": [],
+        "final_results": {},
+    }
+
     model = UNet(in_channels, out_channels)
-    optimizer = optim.Adam(model.parameters(), lr=0.00045)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=2
     )
@@ -59,28 +79,23 @@ def main():
         valid_indices=test_indices,
         transform=input_transform,
     )
-
-    log = {
-        "hyperparameters": {
-            "in_channels": in_channels,
-            "out_channels": out_channels,
-            "optimizer": "Adam",
-            "learning_rate": 0.00045,
-            "scheduler": "ReduceLROnPlateau(factor=0.5, patience=2)",
-            "batch_size": 32,
-            "num_epochs": 50,
-        },
-        "train_history": [],
-        "final_results": {},
-    }
+    pos_weights = compute_class_pos_weights(train_dataset, out_channels).to(device)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = f"results/training_log_{timestamp}.json"
 
     best_model_path = train(
-        device, model, optimizer, scheduler, train_dataset, val_dataset, log, timestamp
+        device,
+        model,
+        optimizer,
+        scheduler,
+        train_dataset,
+        val_dataset,
+        log,
+        timestamp,
+        pos_weights,
     )
-    test(device, model, test_dataset, best_model_path, log)
+    test(device, model, test_dataset, best_model_path, log, pos_weights)
 
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
@@ -88,12 +103,25 @@ def main():
 
 
 def train(
-    device, model, optimizer, scheduler, train_dataset, val_dataset, log, timestamp
+    device,
+    model,
+    optimizer,
+    scheduler,
+    train_dataset,
+    val_dataset,
+    log,
+    timestamp,
+    pos_weights,
 ):
     train_loader = DataLoader(
-        train_dataset, batch_size=32, shuffle=True, num_workers=6, pin_memory=True
+        train_dataset,
+        batch_size=log["hyperparameters"]["batch_size"],
+        shuffle=True,
+        num_workers=6,
+        pin_memory=True,
     )
-    criterion = nn.BCEWithLogitsLoss()
+    pos_weights = pos_weights.to(device)
+    criterion = CustomBCEWithLogitsLoss(pos_weights)
 
     model.to(device)
     best_val_acc = 0.0
@@ -111,14 +139,15 @@ def train(
 
             optimizer.zero_grad()
             outputs = model(inputs)
+
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
             with torch.no_grad():
-                predicted = (torch.sigmoid(outputs) > 0.5).float()
-                true_labels = labels.float()
+                predicted = (torch.sigmoid(outputs) > 0.5).long()
+                true_labels = labels.long()
                 correct_pixels += (predicted == true_labels).sum().item()
                 total_pixels += true_labels.numel()
 
@@ -130,7 +159,9 @@ def train(
         )
 
         # Validate after each epoch
-        val_acc, val_loss, val_f1, val_iou = validate(device, model, val_dataset)
+        val_acc, val_loss, val_f1, val_iou = validate(
+            device, model, val_dataset, pos_weights, log
+        )
 
         print(
             f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}, Val IoU: {val_iou:.4f}\n"
@@ -159,13 +190,17 @@ def train(
     return best_model_path
 
 
-def validate(device, model, val_dataset):
+def validate(device, model, val_dataset, pos_weights, log):
     model.eval()
 
     val_loader = DataLoader(
-        val_dataset, batch_size=32, shuffle=False, num_workers=6, pin_memory=True
+        val_dataset,
+        batch_size=log["hyperparameters"]["batch_size"],
+        shuffle=False,
+        num_workers=6,
+        pin_memory=True,
     )
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = CustomBCEWithLogitsLoss(pos_weights)
 
     # Initialize GPU-based metrics
     f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)
@@ -205,12 +240,14 @@ def validate(device, model, val_dataset):
     return acc, avg_loss, f1, iou
 
 
-def test(device, model, test_dataset, model_path, log=None):
+def test(device, model, test_dataset, model_path, log=None, pos_weights=None):
     model.load_state_dict(torch.load(model_path)["state_dict"])
     model.eval()
 
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True)
-    criterion = nn.BCEWithLogitsLoss()
+    test_loader = DataLoader(
+        test_dataset, batch_size=32, shuffle=False, num_workers=6, pin_memory=True
+    )
+    criterion = CustomBCEWithLogitsLoss(pos_weights)
 
     # GPU-based metrics
     f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)
