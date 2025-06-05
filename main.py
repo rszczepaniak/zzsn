@@ -1,10 +1,11 @@
 import random
-
-from datasets.dataset import MultiClassDataset
+import pathlib
+import torch.nn as nn
 from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
+from datasets.dataset import MultiClassDataset, UnlabeledDataset, PseudoLabeledDataset
 from models.unet import UNet
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torchvision import transforms
 import os
 import torch
@@ -12,7 +13,7 @@ import pickle
 import json
 from datetime import datetime
 
-from utils import compute_class_pos_weights, CustomBCEWithLogitsLoss
+from utils import generate_pseudo_labels
 
 
 def main():
@@ -79,12 +80,11 @@ def main():
         valid_indices=test_indices,
         transform=input_transform,
     )
-    pos_weights = compute_class_pos_weights(train_dataset, out_channels).to(device)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = f"results/training_log_{timestamp}.json"
 
-    best_model_path = train(
+    train(
         device,
         model,
         optimizer,
@@ -93,9 +93,46 @@ def main():
         val_dataset,
         log,
         timestamp,
-        pos_weights,
     )
-    test(device, model, test_dataset, best_model_path, log, pos_weights)
+
+    print("\n=== Kafelkowanie ===")
+    unlabeled_dataset = UnlabeledDataset(
+        root_dir="data/raw",
+        transform=input_transform,
+        tile_size=512,
+        stride=512,
+    )
+
+    print("\n=== Generowanie pseudoetykiet z danych nieoznakowanych ===")
+    generate_pseudo_labels(
+        model, unlabeled_dataset, device, 0.9, "pseudo_data", timestamp
+    )
+    pseudo_data_paths = list(
+        pathlib.Path(os.path.join("pseudo_data", timestamp)).iterdir()
+    )
+    print("\n=== Skończono generację pseudoetykiet z danych nieoznakowanych ===")
+    if len(pseudo_data_paths) > 0:
+        pseudo_dataset = PseudoLabeledDataset(
+            pseudo_data_paths, transform=input_transform
+        )
+        combined_dataset = ConcatDataset([train_dataset, pseudo_dataset])
+        print(f"Dodano {len(pseudo_data_paths)} próbek z pseudoetykietami.\n")
+    else:
+        combined_dataset = train_dataset
+        print("Brak próbek spełniających próg ufności.\n")
+
+    best_model_path = train(
+        device,
+        model,
+        optimizer,
+        scheduler,
+        combined_dataset,
+        val_dataset,
+        log,
+        timestamp,
+    )
+
+    test(device, model, test_dataset, best_model_path, log, False)
 
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
@@ -111,7 +148,6 @@ def train(
     val_dataset,
     log,
     timestamp,
-    pos_weights,
 ):
     train_loader = DataLoader(
         train_dataset,
@@ -120,8 +156,7 @@ def train(
         num_workers=6,
         pin_memory=True,
     )
-    pos_weights = pos_weights.to(device)
-    criterion = CustomBCEWithLogitsLoss(pos_weights)
+    criterion = nn.BCEWithLogitsLoss()
 
     model.to(device)
     best_val_acc = 0.0
@@ -159,9 +194,7 @@ def train(
         )
 
         # Validate after each epoch
-        val_acc, val_loss, val_f1, val_iou = validate(
-            device, model, val_dataset, pos_weights, log
-        )
+        val_acc, val_loss, val_f1, val_iou = validate(device, model, val_dataset, log)
 
         print(
             f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}, Val IoU: {val_iou:.4f}\n"
@@ -190,7 +223,7 @@ def train(
     return best_model_path
 
 
-def validate(device, model, val_dataset, pos_weights, log):
+def validate(device, model, val_dataset, log):
     model.eval()
 
     val_loader = DataLoader(
@@ -200,7 +233,7 @@ def validate(device, model, val_dataset, pos_weights, log):
         num_workers=6,
         pin_memory=True,
     )
-    criterion = CustomBCEWithLogitsLoss(pos_weights)
+    criterion = nn.BCEWithLogitsLoss()
 
     # Initialize GPU-based metrics
     f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)
@@ -240,14 +273,15 @@ def validate(device, model, val_dataset, pos_weights, log):
     return acc, avg_loss, f1, iou
 
 
-def test(device, model, test_dataset, model_path, log=None, pos_weights=None):
-    model.load_state_dict(torch.load(model_path)["state_dict"])
+def test(device, model, test_dataset, model_path, log=None, load_model=False):
+    if load_model:
+        model.load_state_dict(torch.load(model_path)["state_dict"])
     model.eval()
 
     test_loader = DataLoader(
         test_dataset, batch_size=32, shuffle=False, num_workers=6, pin_memory=True
     )
-    criterion = CustomBCEWithLogitsLoss(pos_weights)
+    criterion = nn.BCEWithLogitsLoss()
 
     # GPU-based metrics
     f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)

@@ -4,6 +4,8 @@ import os
 import torch
 import numpy as np
 from torchvision import transforms
+import math
+import rasterio  # Zastąp imageio na rasterio dla dużych TIFF-ów
 
 
 class MultiClassDataset(Dataset):
@@ -108,3 +110,120 @@ class MultiClassDataset(Dataset):
             label_tensor = self.label_transform(label_tensor)
 
         return image, label_tensor
+
+
+class UnlabeledDataset(Dataset):
+    def __init__(self, root_dir, transform=None, tile_size=512, stride=512):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.tile_size = tile_size
+        self.stride = stride
+        self.sample_dirs = [
+            os.path.join(root_dir, d)
+            for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        ]
+
+    def __len__(self):
+        return len(self.sample_dirs)
+
+    def __getitem__(self, idx):
+        sample_path = self.sample_dirs[idx]
+        imagery_dir = os.path.join(sample_path, "imagery")
+
+        # Ensure all files exist
+        required_files = ["red.tif", "green.tif", "blue.tif", "nir.tif"]
+        for fname in required_files:
+            full_path = os.path.join(imagery_dir, fname)
+            if not os.path.isfile(full_path):
+                raise FileNotFoundError(f"Missing {fname} in {imagery_dir}")
+
+        try:
+            with (
+                rasterio.open(os.path.join(imagery_dir, "red.tif")) as red_ds,
+                rasterio.open(os.path.join(imagery_dir, "green.tif")) as green_ds,
+                rasterio.open(os.path.join(imagery_dir, "blue.tif")) as blue_ds,
+                rasterio.open(os.path.join(imagery_dir, "nir.tif")) as nir_ds,
+            ):
+                height, width = red_ds.height, red_ds.width
+
+                tiles = []
+                tile_positions = []
+
+                for y in range(0, height, self.stride):
+                    for x in range(0, width, self.stride):
+                        y_end = min(y + self.tile_size, height)
+                        x_end = min(x + self.tile_size, width)
+                        if y_end - y < self.tile_size or x_end - x < self.tile_size:
+                            continue
+
+                        window = rasterio.windows.Window(x, y, x_end - x, y_end - y)
+
+                        def read_and_norm(ds):
+                            band = ds.read(1, window=window).astype(np.float32)
+                            max_val = band.max()
+                            if max_val == 0:
+                                return band  # or raise Warning?
+                            return band / max_val if max_val > 1 else band
+
+                        tile = torch.stack(
+                            [
+                                torch.from_numpy(read_and_norm(red_ds)),
+                                torch.from_numpy(read_and_norm(green_ds)),
+                                torch.from_numpy(read_and_norm(blue_ds)),
+                                torch.from_numpy(read_and_norm(nir_ds)),
+                            ],
+                            dim=0,
+                        )
+
+                        assert tile.shape == (4, self.tile_size, self.tile_size), (
+                            f"Invalid tile shape: {tile.shape}"
+                        )
+
+                        if self.transform:
+                            tile = self.transform(tile)
+
+                        tiles.append(tile)
+                        tile_positions.append((y, x, y_end, x_end))
+
+            if not tiles:
+                raise ValueError(f"No valid tiles found in {sample_path}")
+
+            return {
+                "tiles": tiles,
+                "positions": tile_positions,
+                "shape": (height, width),
+                "sample_path": sample_path,
+            }
+        except rasterio.errors.RasterioIOError as e:
+            print(f"⚠️ Skipping corrupted file in {sample_path}: {e}")
+            return {
+                "tiles": [],
+                "positions": [],
+                "shape": (0, 0),
+                "sample_path": sample_path,
+            }
+
+
+class PseudoLabeledDataset(Dataset):
+    def __init__(self, pseudo_data_paths, transform=None):
+        self.pseudo_data_paths = pseudo_data_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.pseudo_data_paths)
+
+    def __getitem__(self, idx):
+        data = torch.load(self.pseudo_data_paths[idx], map_location="cpu")
+        image = data["image"]
+        mask = data["mask"]
+
+        assert image.shape == (4, 512, 512), (
+            f"Invalid pseudo image shape: {image.shape}"
+        )
+        assert mask.shape == (9, 512, 512), f"Invalid pseudo mask shape: {mask.shape}"
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, mask

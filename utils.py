@@ -1,3 +1,5 @@
+import shutil
+
 from torchvision import transforms
 from PIL import Image
 import torch.nn as nn
@@ -6,6 +8,11 @@ import torch
 import pickle
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
+
+import warnings
+from rasterio.errors import NotGeoreferencedWarning
+
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 
 def read_class_labels(class_name, i, start, end):
@@ -195,3 +202,75 @@ class CustomBCEWithLogitsLoss(nn.Module):
         return nn.functional.binary_cross_entropy_with_logits(
             input, target, pos_weight=pw
         )
+
+
+def custom_collate_fn(batch):
+    all_tiles = []
+    all_positions = []
+    all_shapes = []
+
+    for sample in batch:
+        all_tiles.extend(sample["tiles"])
+        all_positions.extend(sample["positions"])
+        all_shapes.append(sample["shape"])
+
+    if all_tiles:
+        tiles_tensor = torch.stack(all_tiles)
+    else:
+        tiles_tensor = torch.empty((0, 4, 512, 512))  # Empty placeholder
+
+    return tiles_tensor, all_positions, all_shapes
+
+
+def generate_pseudo_labels(
+    model,
+    unlabeled_dataset,
+    device,
+    threshold=0.9,
+    output_dir="pseudo_data",
+    timestamp=None,
+):
+    model.eval()
+    model.to(device)
+
+    loader = DataLoader(
+        unlabeled_dataset,
+        batch_size=2,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=custom_collate_fn,
+        pin_memory=False,
+    )
+    print("Loader created")
+    workdir = os.path.join(output_dir, timestamp)
+    if os.path.exists(workdir):
+        shutil.rmtree(workdir)
+    os.makedirs(workdir, exist_ok=True)
+
+    with torch.no_grad():
+        for idx, (tiles, tile_positions, sizes) in enumerate(loader):
+            if tiles.shape[0] == 0:
+                continue
+
+            height, width = sizes[
+                0
+            ]  # Not used, but kept for future spatial aggregation if needed
+            sub_batch_size = 8
+
+            for i in range(0, len(tiles), sub_batch_size):
+                sub_tiles = tiles[i : i + sub_batch_size].to(device)  # [B, 4, 512, 512]
+                sub_positions = tile_positions[i : i + sub_batch_size]
+
+                outputs = model(sub_tiles)  # [B, 9, 512, 512]
+                probs = torch.sigmoid(outputs)
+                mask = probs > threshold  # [B, 9, 512, 512]
+
+                for j, (y, x, y_end, x_end) in enumerate(sub_positions):
+                    tile_mask = mask[j].float()  # [9, 512, 512]
+
+                    # Ensure there's at least some confident class
+                    if tile_mask.sum(dim=(1, 2)).max() == 0:
+                        continue
+
+                    output_path = os.path.join(workdir, f"sample_{idx}_tile_{i + j}.pt")
+                    torch.save({"image": sub_tiles[j], "mask": tile_mask}, output_path)
