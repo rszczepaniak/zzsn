@@ -24,6 +24,7 @@ def main():
     learning_rate = 0.0002
     batch_size = 32
     epochs = 1
+    number_of_pseudo_labels_training_epochs = 3
 
     log = {
         "hyperparameters": {
@@ -34,6 +35,7 @@ def main():
             "scheduler": "ReduceLROnPlateau(factor=0.5, patience=2)",
             "batch_size": batch_size,
             "num_epochs": epochs,
+            "num_pseudo_epochs": number_of_pseudo_labels_training_epochs,
         },
         "train_history": [],
         "final_results": {},
@@ -84,7 +86,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = f"results/training_log_{timestamp}.json"
 
-    train(
+    best_model_path = train(
         device,
         model,
         optimizer,
@@ -103,34 +105,36 @@ def main():
         stride=512,
     )
 
-    print("\n=== Generowanie pseudoetykiet z danych nieoznakowanych ===")
-    generate_pseudo_labels(
-        model, unlabeled_dataset, device, 0.9, "pseudo_data", timestamp
-    )
-    pseudo_data_paths = list(
-        pathlib.Path(os.path.join("pseudo_data", timestamp)).iterdir()
-    )
-    print("\n=== Skończono generację pseudoetykiet z danych nieoznakowanych ===")
-    if len(pseudo_data_paths) > 0:
-        pseudo_dataset = PseudoLabeledDataset(
-            pseudo_data_paths, transform=input_transform
+    for i in range(number_of_pseudo_labels_training_epochs):
+        print(
+            f"\n=== Generowanie pseudoetykiet z danych nieoznakowanych: [{i + 1}/{number_of_pseudo_labels_training_epochs}] ==="
         )
-        combined_dataset = ConcatDataset([train_dataset, pseudo_dataset])
-        print(f"Dodano {len(pseudo_data_paths)} próbek z pseudoetykietami.\n")
-    else:
-        combined_dataset = train_dataset
-        print("Brak próbek spełniających próg ufności.\n")
+        generate_pseudo_labels(
+            model, unlabeled_dataset, device, 0.9, "pseudo_data", timestamp
+        )
+        pseudo_data_paths = list(
+            pathlib.Path(os.path.join("pseudo_data", timestamp)).iterdir()
+        )
+        print("\n=== Skończono generację pseudoetykiet z danych nieoznakowanych ===")
+        if len(pseudo_data_paths) > 0:
+            pseudo_dataset = PseudoLabeledDataset(
+                pseudo_data_paths, transform=input_transform
+            )
+            combined_dataset = ConcatDataset([train_dataset, pseudo_dataset])
+        else:
+            combined_dataset = train_dataset
+            print("Brak próbek spełniających próg ufności.\n")
 
-    best_model_path = train(
-        device,
-        model,
-        optimizer,
-        scheduler,
-        combined_dataset,
-        val_dataset,
-        log,
-        timestamp,
-    )
+        best_model_path = train(
+            device,
+            model,
+            optimizer,
+            scheduler,
+            combined_dataset,
+            val_dataset,
+            log,
+            timestamp,
+        )
 
     test(device, model, test_dataset, best_model_path, log, False)
 

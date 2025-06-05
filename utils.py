@@ -241,7 +241,7 @@ def generate_pseudo_labels(
         collate_fn=custom_collate_fn,
         pin_memory=False,
     )
-    print("Loader created")
+
     workdir = os.path.join(output_dir, timestamp)
     if os.path.exists(workdir):
         shutil.rmtree(workdir)
