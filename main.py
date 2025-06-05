@@ -1,5 +1,6 @@
 import random
-
+import pathlib
+import torch.nn as nn
 from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardIndex
 from datasets.dataset import MultiClassDataset, UnlabeledDataset, PseudoLabeledDataset
 from models.unet import UNet
@@ -12,7 +13,7 @@ import pickle
 import json
 from datetime import datetime
 
-from utils import compute_class_pos_weights, CustomBCEWithLogitsLoss, generate_pseudo_labels
+from utils import generate_pseudo_labels
 
 
 def main():
@@ -79,7 +80,6 @@ def main():
         valid_indices=test_indices,
         transform=input_transform,
     )
-    pos_weights = compute_class_pos_weights(train_dataset, out_channels).to(device)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = f"results/training_log_{timestamp}.json"
@@ -93,7 +93,6 @@ def main():
         val_dataset,
         log,
         timestamp,
-        pos_weights,
     )
 
     print("\n=== Kafelkowanie ===")
@@ -106,12 +105,16 @@ def main():
 
     print("\n=== Generowanie pseudoetykiet z danych nieoznakowanych ===")
     generate_pseudo_labels(
-        model, unlabeled_dataset, device, threshold=0.9
+        model, unlabeled_dataset, device, 0.9, "pseudo_data", timestamp
     )
-    pseudo_data_paths = os.listdir("pseudo_data")
+    pseudo_data_paths = list(
+        pathlib.Path(os.path.join("pseudo_data", timestamp)).iterdir()
+    )
     print("\n=== Skończono generację pseudoetykiet z danych nieoznakowanych ===")
     if len(pseudo_data_paths) > 0:
-        pseudo_dataset = PseudoLabeledDataset(pseudo_data_paths, transform=input_transform)
+        pseudo_dataset = PseudoLabeledDataset(
+            pseudo_data_paths, transform=input_transform
+        )
         combined_dataset = ConcatDataset([train_dataset, pseudo_dataset])
         print(f"Dodano {len(pseudo_data_paths)} próbek z pseudoetykietami.\n")
     else:
@@ -127,10 +130,9 @@ def main():
         val_dataset,
         log,
         timestamp,
-        pos_weights,
     )
 
-    test(device, model, test_dataset, best_model_path, log, pos_weights, False)
+    test(device, model, test_dataset, best_model_path, log, False)
 
     with open(log_path, "w") as f:
         json.dump(log, f, indent=2)
@@ -146,7 +148,6 @@ def train(
     val_dataset,
     log,
     timestamp,
-    pos_weights,
 ):
     train_loader = DataLoader(
         train_dataset,
@@ -155,8 +156,7 @@ def train(
         num_workers=6,
         pin_memory=True,
     )
-    pos_weights = pos_weights.to(device)
-    criterion = CustomBCEWithLogitsLoss(pos_weights)
+    criterion = nn.BCEWithLogitsLoss()
 
     model.to(device)
     best_val_acc = 0.0
@@ -166,25 +166,25 @@ def train(
     for epoch in range(log["hyperparameters"]["num_epochs"]):
         model.train()
         correct_pixels = 0
-        total_pixels = 1
-        total_loss = 0.1
+        total_pixels = 0
+        total_loss = 0.0
 
-        # for inputs, labels in train_loader:
-        #     inputs, labels = inputs.to(device), labels.to(device)
-        #
-        #     optimizer.zero_grad()
-        #     outputs = model(inputs)
-        #
-        #     loss = criterion(outputs, labels)
-        #     loss.backward()
-        #     optimizer.step()
-        #     total_loss += loss.item()
-        #
-        #     with torch.no_grad():
-        #         predicted = (torch.sigmoid(outputs) > 0.5).long()
-        #         true_labels = labels.long()
-        #         correct_pixels += (predicted == true_labels).sum().item()
-        #         total_pixels += true_labels.numel()
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+            with torch.no_grad():
+                predicted = (torch.sigmoid(outputs) > 0.5).long()
+                true_labels = labels.long()
+                correct_pixels += (predicted == true_labels).sum().item()
+                total_pixels += true_labels.numel()
 
         train_acc = correct_pixels / total_pixels
         avg_train_loss = total_loss / len(train_loader)
@@ -194,10 +194,7 @@ def train(
         )
 
         # Validate after each epoch
-        print("validation start")
-        val_acc, val_loss, val_f1, val_iou = validate(
-            device, model, val_dataset, pos_weights, log
-        )
+        val_acc, val_loss, val_f1, val_iou = validate(device, model, val_dataset, log)
 
         print(
             f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}, Val IoU: {val_iou:.4f}\n"
@@ -226,7 +223,7 @@ def train(
     return best_model_path
 
 
-def validate(device, model, val_dataset, pos_weights, log):
+def validate(device, model, val_dataset, log):
     model.eval()
 
     val_loader = DataLoader(
@@ -236,35 +233,34 @@ def validate(device, model, val_dataset, pos_weights, log):
         num_workers=6,
         pin_memory=True,
     )
-    criterion = CustomBCEWithLogitsLoss(pos_weights)
+    criterion = nn.BCEWithLogitsLoss()
 
     # Initialize GPU-based metrics
     f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)
     iou_metric = MultilabelJaccardIndex(num_labels=9, average="macro").to(device)
 
-    total_loss = 0.1
+    total_loss = 0.0
     correct_pixels = 0
-    total_pixels = 1
+    total_pixels = 0
 
     with torch.no_grad():
-        pass
-        # for inputs, labels in val_loader:
-        #     inputs, labels = inputs.to(device), labels.to(device)
-        #
-        #     outputs = model(inputs)
-        #     loss = criterion(outputs, labels)
-        #     total_loss += loss.item()
-        #
-        #     predicted = (torch.sigmoid(outputs) > 0.5).long()
-        #     true_labels = labels.long()
-        #
-        #     # Accuracy
-        #     correct_pixels += (predicted == true_labels).sum().item()
-        #     total_pixels += true_labels.numel()
-        #
-        #     # Update torchmetrics
-        #     f1_metric.update(predicted, true_labels)
-        #     iou_metric.update(predicted, true_labels)
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+
+            predicted = (torch.sigmoid(outputs) > 0.5).long()
+            true_labels = labels.long()
+
+            # Accuracy
+            correct_pixels += (predicted == true_labels).sum().item()
+            total_pixels += true_labels.numel()
+
+            # Update torchmetrics
+            f1_metric.update(predicted, true_labels)
+            iou_metric.update(predicted, true_labels)
 
     acc = correct_pixels / total_pixels
     avg_loss = total_loss / len(val_loader)
@@ -277,7 +273,7 @@ def validate(device, model, val_dataset, pos_weights, log):
     return acc, avg_loss, f1, iou
 
 
-def test(device, model, test_dataset, model_path, log=None, pos_weights=None, load_model=False):
+def test(device, model, test_dataset, model_path, log=None, load_model=False):
     if load_model:
         model.load_state_dict(torch.load(model_path)["state_dict"])
     model.eval()
@@ -285,7 +281,7 @@ def test(device, model, test_dataset, model_path, log=None, pos_weights=None, lo
     test_loader = DataLoader(
         test_dataset, batch_size=32, shuffle=False, num_workers=6, pin_memory=True
     )
-    criterion = CustomBCEWithLogitsLoss(pos_weights)
+    criterion = nn.BCEWithLogitsLoss()
 
     # GPU-based metrics
     f1_metric = MultilabelF1Score(num_labels=9, average="macro").to(device)

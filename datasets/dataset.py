@@ -201,8 +201,9 @@ class UnlabeledDataset(Dataset):
                 "tiles": [],
                 "positions": [],
                 "shape": (0, 0),
-                "sample_path": sample_path
+                "sample_path": sample_path,
             }
+
 
 class PseudoLabeledDataset(Dataset):
     def __init__(self, pseudo_data_paths, transform=None):
@@ -213,7 +214,7 @@ class PseudoLabeledDataset(Dataset):
         return len(self.pseudo_data_paths)
 
     def __getitem__(self, idx):
-        data = torch.load(self.pseudo_data_paths[idx])
+        data = torch.load(self.pseudo_data_paths[idx], map_location="cpu")
         image = data["image"]
         mask = data["mask"]
 
