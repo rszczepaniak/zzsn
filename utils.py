@@ -1,16 +1,19 @@
 import shutil
 
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 import torch.nn as nn
 import os
 import torch
 import pickle
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
+import numpy as np
 
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
+
+from models.unet import UNet
 
 warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
@@ -274,3 +277,56 @@ def generate_pseudo_labels(
 
                     output_path = os.path.join(workdir, f"sample_{idx}_tile_{i + j}.pt")
                     torch.save({"image": sub_tiles[j], "mask": tile_mask}, output_path)
+
+
+def predict_and_overlay(rgb_path, nir_path, model_path, class_names, threshold=0.5):
+    # Load model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = UNet(in_channels=4, out_channels=len(class_names))
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint['state_dict'])
+
+    model.to(device)
+    model.eval()
+
+    # Load and preprocess image
+    rgb = Image.open(rgb_path).convert("RGB")
+    nir = Image.open(nir_path)
+
+    rgb_tensor = transforms.ToTensor()(rgb)
+    nir_tensor = transforms.ToTensor()(nir)
+
+    image = torch.cat((rgb_tensor, nir_tensor), dim=0)  # [4, H, W]
+    image = transforms.Normalize([0.5]*4, [0.5]*4)(image)  # Normalize to match training
+    image = image.unsqueeze(0).to(device)  # Add batch dim
+
+    # Forward pass
+    with torch.no_grad():
+        output = model(image)
+        preds = torch.sigmoid(output).squeeze(0).cpu()  # [9, H, W]
+
+    # Threshold predictions
+    masks = (preds > threshold).numpy().astype(np.uint8)
+
+    # Overlay masks on original image
+    rgb_np = np.array(rgb).copy()
+    overlay = rgb_np.copy()
+
+    colors = [
+        (255, 0, 0), (255, 165, 0), (255, 255, 0),
+        (0, 255, 0), (0, 128, 128), (0, 0, 255),
+        (128, 0, 128), (255, 192, 203), (0, 0, 0)
+    ]  # 9 classes
+
+    for i, mask in enumerate(masks):
+        color = colors[i]
+        overlay[mask == 1] = (0.5 * overlay[mask == 1] + 0.5 * np.array(color)).astype(np.uint8)
+
+    # Plot result
+    plt.figure(figsize=(8, 8))
+    plt.imshow(overlay)
+    plt.title("Predicted Labels Overlay")
+    plt.axis("off")
+    plt.savefig("single_annotated.png")
+
+    return overlay  # You can also return masks separately if needed

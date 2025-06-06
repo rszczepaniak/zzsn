@@ -13,7 +13,8 @@ import pickle
 import json
 from datetime import datetime
 
-from utils import generate_pseudo_labels
+from utils import generate_pseudo_labels, predict_and_overlay
+from plot import plot_metrics_on_same_plot
 
 
 def main():
@@ -21,9 +22,9 @@ def main():
 
     in_channels = 4
     out_channels = 9
-    learning_rate = 0.0002
+    learning_rate = 0.0004
     batch_size = 32
-    epochs = 20
+    epochs = 15
     number_of_pseudo_labels_training_epochs = 2
 
     log = {
@@ -336,4 +337,19 @@ def test(device, model, test_dataset, model_path, log=None, load_model=False):
 if __name__ == "__main__":
     # create_all_indices()
     # create_multiclass_indices("train")
-    main()
+    # main()
+    # with open("results/training_log_20250606_080718.json") as fh:
+    #     data = json.load(fh)
+    # plot_metrics_on_same_plot(data, "pseudo_data")
+    class_names = [
+        "double_plant", "drydown", "endrow", "nutrient_deficiency",
+        "planter_skip", "storm_damage", "water", "waterway", "weed_cluster"
+    ]
+
+    overlay = predict_and_overlay(
+        rgb_path="data/supervised/Agriculture-Vision-2021/train/images/rgb/ZP9VV1BTQ_1001-10861-1513-11373.jpg",
+        nir_path="data/supervised/Agriculture-Vision-2021/train/images/nir/ZP9VV1BTQ_1001-10861-1513-11373.jpg",
+        model_path="checkpoints/best_model_20250605_002445.pth",
+        class_names=class_names,
+        threshold=0.5
+    )

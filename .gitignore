@@ -10,3 +10,4 @@ test_result/
 pseudo_data
 results
 datasets/__pycache__/
+plots/
